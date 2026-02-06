@@ -47,6 +47,7 @@ public:
         pub_est = nh->create_publisher<estimate_msgs::msg::Estimate>("est_window", 50);
         pub_start_time = nh->create_publisher<std_msgs::msg::Int64>("start_time", 50);
         pub_cur_scan = nh->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", 2);
+        pub_cur_scan_raw = nh->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan_raw", 2);
         br = std::make_shared<tf2_ros::TransformBroadcaster>(nh);        
         auto lidar_names = nh->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
         assert(nh->get_parameter({"lidars"}, lidar_names));
@@ -106,6 +107,7 @@ public:
                     int64_t time_begin = lidar_data.t_buff.front();
                     lidar_data.t_buff.pop_front();
                     lidar_data.mtx_pc.unlock();
+                    raw_scan_queue.emplace_back(RawScan{time_begin, pc_frame, lidar_name});
                     std::vector<int> indices;
                     pcl::removeNaNFromPointCloud(*pc_frame, *pc_frame, indices);
                     pc_last_ds->clear();
@@ -181,6 +183,7 @@ public:
                     lasermapFovSegment();
                     pc_world.clear();
                     accum_nearest_points.clear();
+                    publishRawScan();
                     t_last_map_upd = max_time_ns;
                 }
             }                      
@@ -199,6 +202,7 @@ private:
     rclcpp::Subscription<livox_interfaces::msg::CustomMsg>::SharedPtr sub_livox_avia;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_hesai;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_livox_mid360_boxi;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan_raw;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
     rclcpp::Publisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
     rclcpp::Publisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
@@ -228,7 +232,14 @@ private:
         std::mutex mtx_pc;
         Eigen::aligned_deque<PointData> pt_buff;
     };
-    std::map<std::string, LidarData> lidars_data;    
+    std::map<std::string, LidarData> lidars_data;
+
+    struct RawScan {
+        int64_t time_begin;
+        pcl::PointCloud<pcl::PointXYZINormal>::Ptr point_cloud;
+        std::string lidar_name;
+    };
+    std::deque<RawScan> raw_scan_queue;   
     Eigen::aligned_deque<PointData> pt_meas;    
 
     bool if_lidar_only;
@@ -259,6 +270,50 @@ private:
     
     const std::string baselink_frame = "base_link";
     const std::string odom_frame = "odom";
+
+    void publishRawScan() {
+        while(!raw_scan_queue.empty()) {
+            RawScan& scan = raw_scan_queue.front();
+            int64_t scan_end_time = scan.time_begin + 1e8; 
+            if (scan_end_time < spline->minTimeNs()) {
+                raw_scan_queue.pop_front();
+                continue;
+            }
+            if (scan_end_time > spline->maxTimeNs()) {
+                break;
+            }
+            pcl::PointCloud<pcl::PointXYZI> pc_deskewed;
+            pc_deskewed.resize(scan.point_cloud->size());
+            const LidarConfig& lidar = lidars.at(scan.lidar_name);
+
+            #pragma omp parallel for num_threads(NUM_OF_THREAD)
+            for (size_t i = 0; i < scan.point_cloud->size(); i++) {
+                pcl::PointXYZINormal pt_in = scan.point_cloud->points[i];
+                int64_t pt_time = scan.time_begin + int64_t(pt_in.intensity * 1e6);
+                pcl::PointXYZINormal pt_out;
+                if (pt_time >= spline->minTimeNs() && pt_time <= spline->maxTimeNs()) {
+                     Association::pointBodyToWorld(pt_time, spline, pt_in, pt_out, (Eigen::Vector3d&)lidar.t_bl, (Eigen::Quaterniond&)lidar.q_bl);
+                     pc_deskewed.points[i].x = pt_out.x;
+                     pc_deskewed.points[i].y = pt_out.y;
+                     pc_deskewed.points[i].z = pt_out.z;
+                     pc_deskewed.points[i].intensity = pt_out.curvature;
+                } else {
+                     pc_deskewed.points[i].x = NAN;
+                     pc_deskewed.points[i].y = NAN;
+                     pc_deskewed.points[i].z = NAN;
+                     pc_deskewed.points[i].intensity = 0;
+                }
+            }
+            std::vector<int> indices;
+            pcl::removeNaNFromPointCloud(pc_deskewed, pc_deskewed, indices);
+            sensor_msgs::msg::PointCloud2 msg;
+            pcl::toROSMsg(pc_deskewed, msg);
+            msg.header.stamp = rclcpp::Time(scan_end_time); 
+            msg.header.frame_id = odom_id;
+            pub_cur_scan_raw->publish(msg);
+            raw_scan_queue.pop_front();
+        }
+    }
 
     void readParameters(rclcpp::Node::SharedPtr &nh)
     {
