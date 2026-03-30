@@ -494,6 +494,7 @@ Mapping(rclcpp::Node::SharedPtr &nh, std::vector<MappingBase<pcl::PointXYZINorma
         opt_old_path.header.frame_id = odom_id;
         vis_maps = mappings;
         pub_odom = nh->create_publisher<nav_msgs::msg::Odometry>("odometry", 500);
+        pub_odom_lidar0 = nh->create_publisher<nav_msgs::msg::Odometry>("odometry_lidar", 500);
         br = std::make_shared<tf2_ros::TransformBroadcaster>(nh);
     }
 
@@ -538,6 +539,7 @@ private:
     rclcpp::Subscription<estimate_msgs::msg::Estimate>::SharedPtr sub_est;
     rclcpp::Subscription<std_msgs::msg::Int64>::SharedPtr sub_start;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_lidar0;
     nav_msgs::msg::Path opt_old_path;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud>::SharedPtr pub_knots;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pub_path;
@@ -627,6 +629,22 @@ private:
             Eigen::Quaterniond q_wl = q_wi * vis_map->lidar.q_bl;
             Eigen::Vector3d t_wl = q_wi * vis_map->lidar.t_bl + t_wi;
             std::string lidar_str = "lidar" + std::to_string(id_lidar) + "_frame";
+
+            if (id_lidar == 0) {
+                nav_msgs::msg::Odometry odom_lidar_msg;
+                odom_lidar_msg.header.stamp = odom_msg.header.stamp;
+                odom_lidar_msg.header.frame_id = odom_id;
+                odom_lidar_msg.child_frame_id = lidar_str;
+                odom_lidar_msg.pose.pose.position.x = t_wl.x();
+                odom_lidar_msg.pose.pose.position.y = t_wl.y();
+                odom_lidar_msg.pose.pose.position.z = t_wl.z();
+                odom_lidar_msg.pose.pose.orientation.w = q_wl.w();
+                odom_lidar_msg.pose.pose.orientation.x = q_wl.x();
+                odom_lidar_msg.pose.pose.orientation.y = q_wl.y();
+                odom_lidar_msg.pose.pose.orientation.z = q_wl.z();
+                pub_odom_lidar0->publish(odom_lidar_msg);
+            }
+
             transformStamped.header.stamp = odom_msg.header.stamp;
             transformStamped.header.frame_id = odom_id;
             transformStamped.child_frame_id = lidar_str;
